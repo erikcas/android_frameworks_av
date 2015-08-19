@@ -121,6 +121,7 @@ AudioTrack::AudioTrack()
       mIsTimed(false),
       mPreviousPriority(ANDROID_PRIORITY_NORMAL),
       mPreviousSchedulingGroup(SP_DEFAULT),
+      mUseSmallBuf(false),
       mPausedPosition(0)
 {
     mAttributes.content_type = AUDIO_CONTENT_TYPE_UNKNOWN;
@@ -365,7 +366,7 @@ status_t AudioTrack::set(
         memcpy(&mAttributes, pAttributes, sizeof(audio_attributes_t));
         ALOGV("Building AudioTrack with attributes: usage=%d content=%d flags=0x%x tags=[%s]",
                 mAttributes.usage, mAttributes.content_type, mAttributes.flags, mAttributes.tags);
-        mStreamType = audio_attributes_to_stream_type(&mAttributes);
+        mStreamType = AUDIO_STREAM_DEFAULT;
     }
 
     // these below should probably come from the audioFlinger too...
@@ -406,14 +407,6 @@ status_t AudioTrack::set(
                 ((flags | AUDIO_OUTPUT_FLAG_DIRECT) & ~AUDIO_OUTPUT_FLAG_FAST);
     }
 
-    // only allow deep buffering for music stream type
-    if (mStreamType != AUDIO_STREAM_MUSIC) {
-        flags = (audio_output_flags_t)(flags &~AUDIO_OUTPUT_FLAG_DEEP_BUFFER);
-        if (flags & AUDIO_OUTPUT_FLAG_COMPRESS_OFFLOAD) {
-            ALOGE("Offloading only allowed with music stream");
-            return BAD_VALUE; // To trigger fallback or let the client handle
-        }
-    }
 
     audio_stream_type_t attr_streamType = (mStreamType == AUDIO_STREAM_DEFAULT) ?
                                            audio_attributes_to_stream_type(&mAttributes):
@@ -608,6 +601,12 @@ status_t AudioTrack::start()
         // force refresh of remaining frames by processAudioBuffer() as last
         // write before stop could be partial.
         mRefreshRemaining = true;
+
+        // for static track, clear the old flags when start from stopped state
+        if (mSharedBuffer != 0)
+            android_atomic_and(
+                    ~(CBLK_LOOP_CYCLE | CBLK_LOOP_FINAL | CBLK_BUFFER_END),
+                    &mCblk->mFlags);
     }
     mNewPosition = mPosition + mUpdatePeriod;
     int32_t flags = android_atomic_and(~CBLK_DISABLED, &mCblk->mFlags);
