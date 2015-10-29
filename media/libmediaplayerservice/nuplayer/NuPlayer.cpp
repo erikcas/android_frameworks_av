@@ -625,6 +625,92 @@ void NuPlayer::onMessageReceived(const sp<AMessage> &msg) {
                 onResume();
             } else {
                 onStart();
+
+            mVideoIsAVC = false;
+            mOffloadAudio = false;
+            mOffloadDecodedPCM = false;
+            mSwitchingFromPcmOffload = false;
+            mAudioEOS = false;
+            mVideoEOS = false;
+            mSkipRenderingAudioUntilMediaTimeUs = -1;
+            mSkipRenderingVideoUntilMediaTimeUs = -1;
+            mNumFramesTotal = 0;
+            mNumFramesDropped = 0;
+            mStarted = true;
+
+            /* instantiate decoders now for secure playback */
+            if (mSourceFlags & Source::FLAG_SECURE) {
+                if (mNativeWindow != NULL) {
+                    instantiateDecoder(false, &mVideoDecoder);
+                }
+
+                if (mAudioSink != NULL) {
+                    instantiateDecoder(true, &mAudioDecoder);
+                }
+            }
+
+            sp<MetaData> audioMeta = mSource->getFormatMeta(true /* audio */);
+            mSource->start();
+
+            uint32_t flags = 0;
+
+            if (mSource->isRealTime()) {
+                flags |= Renderer::FLAG_REAL_TIME;
+            }
+
+            audio_stream_type_t streamType = AUDIO_STREAM_MUSIC;
+            if (mAudioSink != NULL) {
+                streamType = mAudioSink->getAudioStreamType();
+            }
+
+            sp<AMessage> videoFormat = mSource->getFormat(false /* audio */);
+            sp<MetaData> vMeta = new MetaData;
+            convertMessageToMetaData(videoFormat, vMeta);
+
+            const char *mime = NULL;
+            if (audioMeta != NULL) {
+                audioMeta->findCString(kKeyMIMEType, &mime);
+            }
+            mOffloadAudio =
+                        canOffloadStream(audioMeta, (videoFormat != NULL), vMeta,
+                                mIsStreaming /* is_streaming */, streamType);
+            if (!mOffloadAudio && (audioMeta != NULL)) {
+                sp<MetaData> audioSourceMeta = mSource->getFormatMeta(true/* audio */);
+                sp<MetaData> audioPCMMeta =
+                        ExtendedUtils::createPCMMetaFromSource(audioSourceMeta);
+
+                mOffloadAudio =
+                        ((mime && !ExtendedUtils::pcmOffloadException(mime)) &&
+                        canOffloadStream(audioPCMMeta, (videoFormat != NULL), vMeta,
+                                mIsStreaming /* is_streaming */, streamType));
+                mOffloadDecodedPCM = mOffloadAudio;
+                ALOGI("Could not offload audio decode, pcm offload decided :%d",
+                        mOffloadDecodedPCM);
+            }
+
+            if (mOffloadAudio) {
+                flags |= Renderer::FLAG_OFFLOAD_AUDIO;
+            }
+
+            sp<AMessage> notify = new AMessage(kWhatRendererNotify, id());
+            ++mRendererGeneration;
+            notify->setInt32("generation", mRendererGeneration);
+            if (mPlayerExtendedStats != NULL) {
+                notify->setObject(MEDIA_EXTENDED_STATS, mPlayerExtendedStats);
+            }
+            mRenderer = new Renderer(mAudioSink, notify, flags);
+
+            mRendererLooper = new ALooper;
+            mRendererLooper->setName("NuPlayerRenderer");
+            mRendererLooper->start(false, false, ANDROID_PRIORITY_AUDIO);
+            mRendererLooper->registerHandler(mRenderer);
+
+            sp<MetaData> meta = getFileMeta();
+            int32_t rate;
+            if (meta != NULL
+                    && meta->findInt32(kKeyFrameRate, &rate) && rate > 0) {
+                mRenderer->setVideoFrameRate(rate);
+                PLAYER_STATS(setFrameRate, rate);
             }
             mPausedByClient = false;
             break;
@@ -774,8 +860,13 @@ void NuPlayer::onMessageReceived(const sp<AMessage> &msg) {
                 sp<AMessage> format;
                 CHECK(msg->findMessage("format", &format));
 
-                sp<AMessage> inputFormat =
-                        mSource->getFormat(false /* audio */);
+                ALOGV("decoder %s output format changed", audio ? "audio" : "video");
+                if (audio) {
+                    openAudioSink(format, false /*offloadOnly*/);
+                } else {
+                    // video
+                    sp<AMessage> inputFormat =
+                            mSource->getFormat(false /* audio */);
 
                 updateVideoSize(inputFormat, format);
             } else if (what == DecoderBase::kWhatShutdownCompleted) {
@@ -921,20 +1012,31 @@ void NuPlayer::onMessageReceived(const sp<AMessage> &msg) {
                 int32_t reason;
                 CHECK(msg->findInt32("reason", &reason));
                 closeAudioSink();
+                sp<MetaData> audioMeta = mSource->getFormatMeta(true /* audio */);
                 if (!mOffloadDecodedPCM) {
                     mAudioDecoder.clear();
                     ++mAudioDecoderGeneration;
                 } else {
                     ALOGV("Decoded PCM offload flushing");
                     if (mAudioDecoder != NULL) {
-                        flushDecoder(true /* audio */, true/* needShutdown */);
+                        mSwitchingFromPcmOffload = true;
+                        flushDecoder(true /* audio */, false/* needShutdown */);
                     }
                 }
-                mRenderer->flush(
-                        true /* audio */, false /* notifyComplete */);
+                mRenderer->flush(true /* audio */);
                 if (mVideoDecoder != NULL) {
-                    mRenderer->flush(
-                            false /* audio */, false /* notifyComplete */);
+                    mRenderer->flush(false /* audio */);
+                }
+                mRenderer->signalDisableOffloadAudio();
+                mOffloadAudio = false;
+                mOffloadDecodedPCM = false;
+                if ((ExtendedUtils::isRAWFormat(audioMeta) &&
+                    ExtendedUtils::is24bitPCMOffloadEnabled() &&
+                    ExtendedUtils::getPcmSampleBits(audioMeta) == 24)) {
+                    ALOGI("update pcm format in WAVExtractor to 16 bit");
+                    ExtendedUtils::setKeyPCMFormat(audioMeta, AUDIO_FORMAT_PCM_16_BIT );
+                    mSource->stop();
+                    mSource->start();
                 }
 
                 performSeek(positionUs, false /* needNotify */);
@@ -1342,25 +1444,23 @@ status_t NuPlayer::instantiateDecoder(bool audio, sp<DecoderBase> *decoder) {
         sp<MetaData> audioMeta = mSource->getFormatMeta(true /* audio */);
 
         if (mOffloadAudio && !mOffloadDecodedPCM) {
-            if (ExtendedUtils::is24bitPCMOffloadEnabled()) {
-                sp<MetaData> audioMeta = mSource->getFormatMeta(true /* audio */);
-                if (ExtendedUtils::is24bitPCMOffloaded(audioMeta)) {
-                    ALOGV("Overriding PCM format with 24 bit and calling start");
-                    ExtendedUtils::setKeyPCMFormat(audioMeta, AUDIO_FORMAT_PCM_8_24_BIT);
-                    mSource->stop();
-                    mSource->start();
-                }
+            if (ExtendedUtils::isRAWFormat(audioMeta) &&
+                ExtendedUtils::is24bitPCMOffloadEnabled() &&
+                (ExtendedUtils::getPcmSampleBits(audioMeta) == 24)) {
+                ExtendedUtils::setKeyPCMFormat(audioMeta,AUDIO_FORMAT_PCM_8_24_BIT);
+                ALOGI("update pcmformat in WAVExtractor to 24 bit");
+                mSource->stop();
+                mSource->start();
             }
             *decoder = new DecoderPassThrough(notify, mSource, mRenderer);
         } else {
-            if (ExtendedUtils::is24bitPCMOffloadEnabled()) {
-                sp<MetaData> audioMeta = mSource->getFormatMeta(true /* audio */);
-                if (ExtendedUtils::is24bitPCMOffloaded(audioMeta)) {
-                    ALOGV("Setting 16 bit in case session is not offloaded");
-                    ExtendedUtils::setKeyPCMFormat(audioMeta, AUDIO_FORMAT_PCM_16_BIT);
-                    mSource->stop();
-                    mSource->start();
-                }
+            if (ExtendedUtils::isRAWFormat(audioMeta) &&
+                ExtendedUtils::is24bitPCMOffloadEnabled() &&
+                (ExtendedUtils::getPcmSampleBits(audioMeta) == 24)) {
+                ExtendedUtils::setKeyPCMFormat(audioMeta,AUDIO_FORMAT_PCM_16_BIT);
+                ALOGI("update pcmformat in WAVExtractor to 16 bit");
+                mSource->stop();
+                mSource->start();
             }
             *decoder = new Decoder(notify, mSource, mRenderer);
         }
@@ -1477,6 +1577,11 @@ status_t NuPlayer::feedDecoderInputData(bool audio, const sp<AMessage> &msg) {
                      audio ? "audio" : "video", formatChange, timeChange);
 
                 if (audio) {
+                    if (mSwitchingFromPcmOffload) {
+                        //force format change if the discontinuity was triggered from fallback
+                        formatChange = true;
+                        mSwitchingFromPcmOffload = false;
+                    }
                     mSkipRenderingAudioUntilMediaTimeUs = -1;
                 } else {
                     mSkipRenderingVideoUntilMediaTimeUs = -1;
@@ -2207,6 +2312,28 @@ void NuPlayer::onSourceNotify(const sp<AMessage> &msg) {
         {
             int32_t percentage;
             CHECK(msg->findInt32("percentage", &percentage));
+
+            int64_t durationUs = 0;
+            msg->findInt64("duration", &durationUs);
+
+            bool eos = mVideoEOS || mAudioEOS
+                    || percentage == 100; // sources return 100% after EOS
+            if (!mBuffering && durationUs < kLowWaterMarkUs && !eos) {
+                mBuffering = true;
+                if (mPlaying) {
+                    pause();
+                }
+                notifyListener(MEDIA_INFO, MEDIA_INFO_BUFFERING_START, 0);
+                ALOGI("cache running low (< %g secs)..pausing",
+                        (double)durationUs / 1000000.0);
+            } else if (mBuffering && (eos || durationUs > kHighWaterMarkUs)) {
+                if (!mPlaying) {
+                    resume();
+                    ALOGI("cache has filled up..resuming");
+                }
+                notifyListener(MEDIA_INFO, MEDIA_INFO_BUFFERING_END, 0);
+                mBuffering = false;
+            }
 
             notifyListener(MEDIA_BUFFERING_UPDATE, percentage, 0);
             break;

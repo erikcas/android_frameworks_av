@@ -70,6 +70,7 @@ PlaylistFetcher::PlaylistFetcher(
       mStartTimeUsRelative(false),
       mLastPlaylistFetchTimeUs(-1ll),
       mSeqNumber(-1),
+      mLastSeqNumber(-1),
       mNumRetries(0),
       mStartup(true),
       mAdaptive(false),
@@ -343,7 +344,8 @@ void PlaylistFetcher::startAsync(
         int64_t startTimeUs,
         int64_t segmentStartTimeUs,
         int32_t startDiscontinuitySeq,
-        bool adaptive) {
+        bool adaptive,
+        int32_t lastSeq) {
     sp<AMessage> msg = new AMessage(kWhatStart, id());
 
     uint32_t streamTypeMask = 0ul;
@@ -368,6 +370,7 @@ void PlaylistFetcher::startAsync(
     msg->setInt64("segmentStartTimeUs", segmentStartTimeUs);
     msg->setInt32("startDiscontinuitySeq", startDiscontinuitySeq);
     msg->setInt32("adaptive", adaptive);
+    msg->setInt32("sequenceNumber", lastSeq);
     msg->post();
 }
 
@@ -460,10 +463,12 @@ status_t PlaylistFetcher::onStart(const sp<AMessage> &msg) {
     int64_t segmentStartTimeUs;
     int32_t startDiscontinuitySeq;
     int32_t adaptive;
+    int32_t lastSeq;
     CHECK(msg->findInt64("startTimeUs", &startTimeUs));
     CHECK(msg->findInt64("segmentStartTimeUs", &segmentStartTimeUs));
     CHECK(msg->findInt32("startDiscontinuitySeq", &startDiscontinuitySeq));
     CHECK(msg->findInt32("adaptive", &adaptive));
+    CHECK(msg->findInt32("sequenceNumber", &lastSeq));
 
     if (streamTypeMask & LiveSession::STREAMTYPE_AUDIO) {
         void *ptr;
@@ -496,6 +501,7 @@ status_t PlaylistFetcher::onStart(const sp<AMessage> &msg) {
 
     mSegmentStartTimeUs = segmentStartTimeUs;
     mDiscontinuitySeq = startDiscontinuitySeq;
+    mLastSeqNumber = lastSeq;
 
     if (startTimeUs >= 0) {
         mStartTimeUs = startTimeUs;
@@ -627,7 +633,7 @@ void PlaylistFetcher::onMonitorQueue() {
         durationToBufferUs = kMinBufferedDurationUs;
     }
 
-    int64_t bufferedDurationUs = 0ll;
+    int64_t bufferedDurationUs = -1ll;
     status_t finalResult = NOT_ENOUGH_DATA;
     if (mStreamTypeMask == LiveSession::STREAMTYPE_SUBTITLES) {
         sp<AnotherPacketSource> packetSource =
@@ -637,7 +643,10 @@ void PlaylistFetcher::onMonitorQueue() {
                 packetSource->getBufferedDurationUs(&finalResult);
         finalResult = OK;
     } else {
-        // Use max stream duration to prevent us from waiting on a non-existent stream;
+        // In steady-state playback, the TS parser will ensure that mStreamTypeMask
+        // correctly reflects the streams that are present. In this case, use min stream
+        // duration to ensure that all streams are buffered. Otherwise (when mStartup is set)
+        // use max stream duration to prevent us from waiting on a non-existent stream;
         // when we cannot make out from the manifest what streams are included in a playlist
         // we might assume extra streams.
         for (size_t i = 0; i < mPacketSources.size(); ++i) {
@@ -647,10 +656,18 @@ void PlaylistFetcher::onMonitorQueue() {
 
             int64_t bufferedStreamDurationUs =
                 mPacketSources.valueAt(i)->getBufferedDurationUs(&finalResult);
-            ALOGV("buffered %" PRId64 " for stream %d",
-                    bufferedStreamDurationUs, mPacketSources.keyAt(i));
-            if (bufferedStreamDurationUs > bufferedDurationUs) {
-                bufferedDurationUs = bufferedStreamDurationUs;
+            ALOGV("buffered %" PRId64 " for stream %d (startup = %s)",
+                    bufferedStreamDurationUs, mPacketSources.keyAt(i),
+                    mStartup ? "true" : "false");
+            if (mStartup) {
+                if (bufferedStreamDurationUs > bufferedDurationUs) {
+                    bufferedDurationUs = bufferedStreamDurationUs;
+                }
+            } else {
+                if (bufferedDurationUs < 0 ||
+                        bufferedStreamDurationUs < bufferedDurationUs) {
+                    bufferedDurationUs = bufferedStreamDurationUs;
+                }
             }
         }
     }
@@ -770,11 +787,11 @@ void PlaylistFetcher::onDownloadNext() {
                     mStartTimeUs, mSeqNumber, firstSeqNumberInPlaylist,
                     lastSeqNumberInPlaylist);
         } else {
-            // When adapting or track switching, mSegmentStartTimeUs (relative
-            // to media time 0) is used to determine the start segment; mStartTimeUs (absolute
-            // timestamps coming from the media container) is used to determine the position
-            // inside a segments.
-            mSeqNumber = getSeqNumberForTime(mSegmentStartTimeUs);
+            if (mLastSeqNumber > 0) {
+                mSeqNumber = mLastSeqNumber;
+            } else {
+                mSeqNumber = getSeqNumberForTime(mSegmentStartTimeUs);
+            }
             if (mAdaptive) {
                 // avoid double fetch/decode
                 mSeqNumber += 1;
@@ -857,6 +874,10 @@ void PlaylistFetcher::onDownloadNext() {
                 mSeqNumber = firstSeqNumberInPlaylist;
             }
             discontinuity = true;
+
+            // Since we are starting from a new sequence number
+            // treat this as seek
+            mSegmentStartTimeUs = -1;
 
             // fall through
         } else {
@@ -1184,6 +1205,7 @@ const sp<ABuffer> &PlaylistFetcher::setAccessUnitProperties(
 
     accessUnit->meta()->setInt32("discontinuitySeq", mDiscontinuitySeq);
     accessUnit->meta()->setInt64("segmentStartTimeUs", getSegmentStartTimeUs(mSeqNumber));
+    accessUnit->meta()->setInt32("sequenceNumber", mSeqNumber);
     return accessUnit;
 }
 

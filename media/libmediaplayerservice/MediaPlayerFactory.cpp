@@ -215,7 +215,8 @@ class StagefrightPlayerFactory :
             }
         }
 
-        if (getDefaultPlayerType() == STAGEFRIGHT_PLAYER) {
+        if (getDefaultPlayerType()
+                == STAGEFRIGHT_PLAYER) {
             char buf[20];
             lseek(fd, offset, SEEK_SET);
             read(fd, buf, sizeof(buf));

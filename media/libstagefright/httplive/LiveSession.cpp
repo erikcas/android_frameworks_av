@@ -1525,6 +1525,14 @@ void LiveSession::onChangeConfiguration3(const sp<AMessage> &msg) {
                         if (discontinuitySeq < 0 || seq < discontinuitySeq) {
                             discontinuitySeq = seq;
                         }
+
+                        // sequenceNumber is never set for subtitle tracks
+                        if (i != kSubtitleIndex && j != kSubtitleIndex) {
+                            CHECK(meta->findInt32("sequenceNumber", &seq));
+                            if (latestSeq < 0 || seq > latestSeq) {
+                                latestSeq = seq;
+                            }
+                        }
                     }
 
                     if (pickTrack) {
@@ -1559,14 +1567,17 @@ void LiveSession::onChangeConfiguration3(const sp<AMessage> &msg) {
                 startTimeUs < 0 ? mLastSeekTimeUs : startTimeUs,
                 segmentStartTimeUs,
                 discontinuitySeq,
-                switching);
+                switching,
+                latestSeq);
     }
 
     // All fetchers have now been started, the configuration change
     // has completed.
 
-    cancelCheckBandwidthEvent();
-    scheduleCheckBandwidthEvent();
+    if (mPlaylist->isVariantPlaylist()) {
+        cancelCheckBandwidthEvent();
+        scheduleCheckBandwidthEvent();
+    }
 
     ALOGV("XXX configuration change completed.");
     mReconfigurationInProgress = false;
@@ -1630,7 +1641,7 @@ void LiveSession::onCheckSwitchDown() {
     }
 
     if (mSwitchInProgress || mReconfigurationInProgress) {
-        ALOGV("Switch/Reconfig in progress, defer switch down");
+        ALOGV("Switch or Reconfig in progress, defer switch down");
         mSwitchDownMonitor->post(1000000ll);
         return;
     }
@@ -1773,8 +1784,11 @@ void LiveSession::postPrepared(status_t err) {
 
     mInPreparationPhase = false;
 
-    mSwitchDownMonitor = new AMessage(kWhatCheckSwitchDown, id());
-    mSwitchDownMonitor->post();
+    //start switchdown monitor only for variant playlists
+    if (mPlaylist->isVariantPlaylist()) {
+        mSwitchDownMonitor = new AMessage(kWhatCheckSwitchDown, id());
+        mSwitchDownMonitor->post();
+    }
 }
 
 }  // namespace android
