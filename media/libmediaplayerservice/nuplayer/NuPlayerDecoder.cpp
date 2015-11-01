@@ -364,7 +364,14 @@ void NuPlayer::Decoder::onResume(bool notifyComplete) {
     if (notifyComplete) {
         mResumePending = true;
     }
-    mCodec->start();
+
+    if (mCodec != NULL) {
+        mCodec->start();
+    } else {
+        ALOGW("Decoder %s onResume without a valid codec object",
+              mComponentName.c_str());
+        handleError(NO_INIT);
+    }
 }
 
 void NuPlayer::Decoder::doFlush(bool notifyComplete) {
@@ -564,6 +571,11 @@ bool NuPlayer::Decoder::handleAnOutputBuffer(
 //    CHECK_LT(bufferIx, mOutputBuffers.size());
     sp<ABuffer> buffer;
     mCodec->getOutputBuffer(index, &buffer);
+
+    if (buffer == NULL) {
+        handleError(UNKNOWN_ERROR);
+        return false;
+    }
 
     if (index >= mOutputBuffers.size()) {
         for (size_t i = mOutputBuffers.size(); i <= index; ++i) {
