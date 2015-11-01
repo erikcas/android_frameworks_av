@@ -2118,9 +2118,8 @@ status_t MPEG4Extractor::parseChunk(off64_t *offset, int depth) {
                 size = 0;
             }
 
-            if ((chunk_size > SIZE_MAX) || (SIZE_MAX - chunk_size <= size)) {
+            if (SIZE_MAX - chunk_size <= size)
                 return ERROR_MALFORMED;
-            }
 
             uint8_t *buffer = new (std::nothrow) uint8_t[size + chunk_size];
             if (buffer == NULL) {
@@ -2158,7 +2157,7 @@ status_t MPEG4Extractor::parseChunk(off64_t *offset, int depth) {
                 ALOGV("chunk_data_size = %lld and data_offset = %lld",
                         chunk_data_size, data_offset);
 
-                if (chunk_data_size < 0 || static_cast<uint64_t>(chunk_data_size) >= SIZE_MAX - 1) {
+                if (chunk_data_size >= SIZE_MAX - 1) {
                     return ERROR_MALFORMED;
                 }
                 sp<ABuffer> buffer = new ABuffer(chunk_data_size + 1);

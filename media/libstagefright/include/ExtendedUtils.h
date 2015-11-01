@@ -1,4 +1,4 @@
-/* Copyright (c) 2013 - 2014, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2013 - 2015, The Linux Foundation. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions are
@@ -92,6 +92,9 @@ struct ExtendedUtils {
 
         static int32_t getHFRRatio(
                 const sp<MetaData> &meta);
+
+        static void addDecodingTimesFromBatch(MediaBuffer *buf,
+                List<int64_t>& decodeTimeQueue);
 
         private:
         // Query supported capabilities from target-specific profiles
@@ -200,6 +203,17 @@ struct ExtendedUtils {
 
     };
 
+#ifdef DTS_CODEC_M_
+    /*
+     * This class is a placeholder for set of methods used
+     * to support DTS contents in HLS streaming
+     */
+    struct DTS {
+        static size_t parseDTSSyncFrame(const uint8_t *ptr, size_t size,
+                                      sp<MetaData> *metaData);
+        static bool IsSeeminglyValidDTSHeader(const uint8_t *ptr, size_t size);
+    };
+#endif //DTS_CODEC_M_
 
     static const int32_t kNumBFramesPerPFrame = 1;
     static bool mIsQCHWAACEncoder;
@@ -218,12 +232,16 @@ struct ExtendedUtils {
 
     static bool is24bitPCMOffloadEnabled();
     static bool is16bitPCMOffloadEnabled();
+    static bool isTrackOffloadEnabled();
     static bool isRAWFormat(const sp<MetaData> &meta);
     static bool isRAWFormat(const sp<AMessage> &format);
     static int32_t getPcmSampleBits(const sp<MetaData> &meta);
     static int32_t getPcmSampleBits(const sp<AMessage> &format);
     static int32_t getPCMFormat(const sp<MetaData> &meta);
     static void setKeyPCMFormat(const sp<MetaData> &meta, int32_t pcmFormat);
+    static status_t convertToSinkFormat(const sp<ABuffer> &buffer, sp<ABuffer> &newBuffer,
+                                        audio_format_t srcFormat, audio_format_t pcmFormat,
+                                        bool isOffload);
 
     static sp<MediaExtractor> MediaExtractor_CreateIfNeeded(
             sp<MediaExtractor> defaultExt, const sp<DataSource> &source,

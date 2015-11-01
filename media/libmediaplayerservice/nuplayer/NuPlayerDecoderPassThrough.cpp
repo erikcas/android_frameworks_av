@@ -29,6 +29,7 @@
 #include <media/stagefright/foundation/ADebug.h>
 #include <media/stagefright/foundation/AMessage.h>
 #include <media/stagefright/MediaErrors.h>
+#include <media/stagefright/MediaDefs.h>
 
 #include "ATSParser.h"
 
@@ -54,7 +55,8 @@ NuPlayer::DecoderPassThrough::DecoderPassThrough(
       mPendingAudioErr(OK),
       mPendingBuffersToDrain(0),
       mCachedBytes(0),
-      mComponentName("pass through decoder") {
+      mComponentName("pass through decoder"),
+      mPCMFormat(AUDIO_FORMAT_INVALID) {
     ALOGW_IF(renderer == NULL, "expect a non-NULL renderer");
 }
 
@@ -79,18 +81,32 @@ void NuPlayer::DecoderPassThrough::onConfigure(const sp<AMessage> &format) {
     uint32_t isStreaming = 0;
     format->findInt32("isStreaming", (int32_t *)&isStreaming);
 
+    uint32_t hasVideo = 0;
+    format->findInt32("has-video", (int32_t *)&hasVideo);
+
     // The audio sink is already opened before the PassThrough decoder is created.
     // Opening again might be relevant if decoder is instantiated after shutdown and
     // format is different.
+    sp<MetaData> audioMeta = mSource->getFormatMeta(true /* audio */);
     if (ExtendedUtils::is24bitPCMOffloadEnabled()) {
-        sp<MetaData> audioMeta = mSource->getFormatMeta(true /* audio */);
         if (ExtendedUtils::is24bitPCMOffloaded(audioMeta)) {
             format->setInt32("sbit", 24);
         }
     }
 
+    const char * mime;
+    audioMeta->findCString(kKeyMIMEType, &mime);
+    bool pcm = mime && !strcasecmp(MEDIA_MIMETYPE_AUDIO_RAW, mime);
+    if (pcm) {
+        audio_format_t pcmFormat = (audio_format_t)ExtendedUtils::getPCMFormat(audioMeta);
+        if (pcmFormat != AUDIO_FORMAT_INVALID) {
+            mPCMFormat = pcmFormat;
+            format->setInt32("pcm-format", (int32_t)pcmFormat);
+        }
+    }
+
     status_t err = mRenderer->openAudioSink(
-            format, true /* offloadOnly */, false /* hasVideo */,
+            format, true /* offloadOnly */, hasVideo,
             AUDIO_OUTPUT_FLAG_NONE /* flags */, isStreaming, NULL /* isOffloaded */);
     if (err != OK) {
         handleError(err);
@@ -215,6 +231,9 @@ sp<ABuffer> NuPlayer::DecoderPassThrough::aggregateBuffer(
             memcpy(mAggregateBuffer->base() + bigSize, accessUnit->data(), smallSize);
             bigSize += smallSize;
             mAggregateBuffer->setRange(0, bigSize);
+            if (mPCMFormat != AUDIO_FORMAT_INVALID) {
+                mAggregateBuffer->meta()->setInt32("pcm-format", (int32_t)mPCMFormat);
+            }
 
             ALOGV("feedDecoderInputData() smallSize = %zu, bigSize = %zu, capacity = %zu",
                     smallSize, bigSize, mAggregateBuffer->capacity());
@@ -385,7 +404,7 @@ void NuPlayer::DecoderPassThrough::onFlush(bool notifyComplete) {
 
     if (mRenderer != NULL) {
         mRenderer->flush(true /* audio */, notifyComplete);
-        mRenderer->signalTimeDiscontinuity();
+        mRenderer->signalTimeDiscontinuity(true /* audio */);
     }
 
     if (notifyComplete) {

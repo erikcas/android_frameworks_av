@@ -627,7 +627,7 @@ void PlaylistFetcher::onMonitorQueue() {
         durationToBufferUs = kMinBufferedDurationUs;
     }
 
-    int64_t bufferedDurationUs = 0ll;
+    int64_t bufferedDurationUs = -1ll;
     status_t finalResult = NOT_ENOUGH_DATA;
     if (mStreamTypeMask == LiveSession::STREAMTYPE_SUBTITLES) {
         sp<AnotherPacketSource> packetSource =
@@ -637,7 +637,10 @@ void PlaylistFetcher::onMonitorQueue() {
                 packetSource->getBufferedDurationUs(&finalResult);
         finalResult = OK;
     } else {
-        // Use max stream duration to prevent us from waiting on a non-existent stream;
+        // In steady-state playback, the TS parser will ensure that mStreamTypeMask
+        // correctly reflects the streams that are present. In this case, use min stream
+        // duration to ensure that all streams are buffered. Otherwise (when mStartup is set)
+        // use max stream duration to prevent us from waiting on a non-existent stream;
         // when we cannot make out from the manifest what streams are included in a playlist
         // we might assume extra streams.
         for (size_t i = 0; i < mPacketSources.size(); ++i) {
@@ -647,10 +650,18 @@ void PlaylistFetcher::onMonitorQueue() {
 
             int64_t bufferedStreamDurationUs =
                 mPacketSources.valueAt(i)->getBufferedDurationUs(&finalResult);
-            ALOGV("buffered %" PRId64 " for stream %d",
-                    bufferedStreamDurationUs, mPacketSources.keyAt(i));
-            if (bufferedStreamDurationUs > bufferedDurationUs) {
-                bufferedDurationUs = bufferedStreamDurationUs;
+            ALOGV("buffered %" PRId64 " for stream %d (startup = %s)",
+                    bufferedStreamDurationUs, mPacketSources.keyAt(i),
+                    mStartup ? "true" : "false");
+            if (mStartup) {
+                if (bufferedStreamDurationUs > bufferedDurationUs) {
+                    bufferedDurationUs = bufferedStreamDurationUs;
+                }
+            } else {
+                if (bufferedDurationUs < 0 ||
+                        bufferedStreamDurationUs < bufferedDurationUs) {
+                    bufferedDurationUs = bufferedStreamDurationUs;
+                }
             }
         }
     }
@@ -1221,6 +1232,13 @@ status_t PlaylistFetcher::extractAndQueueAccessUnitsFromTs(const sp<ABuffer> &bu
     buffer->setRange(buffer->offset() + offset, buffer->size() - offset);
 
     status_t err = OK;
+    // During SEEK video always starts from closest preceding IDR frame
+    // Adjust mStartTimeUs( seek time ) to lastIDRTimeUs so that audio
+    // also starts from same time.
+    // Since the for loop below starts from higher index VIDEO stream
+    // will be parsed first, this will ensure that lastIDRTimeUs will be
+    // set for AUDIO. Assumption here is enum VIDEO > AUDIO
+    int64_t lastIDRTimeUs = -1;
     for (size_t i = mPacketSources.size(); i-- > 0;) {
         sp<AnotherPacketSource> packetSource = mPacketSources.valueAt(i);
 
@@ -1247,6 +1265,12 @@ status_t PlaylistFetcher::extractAndQueueAccessUnitsFromTs(const sp<ABuffer> &bu
 
             default:
                 TRESPASS();
+        }
+
+        if (lastIDRTimeUs >= 0) {
+            ALOGI("Adjusting seek time to IDR %" PRId64 "us from %" PRId64 "us",
+                   lastIDRTimeUs, mStartTimeUs);
+            mStartTimeUs = lastIDRTimeUs;
         }
 
         sp<AnotherPacketSource> source =
@@ -1295,6 +1319,7 @@ status_t PlaylistFetcher::extractAndQueueAccessUnitsFromTs(const sp<ABuffer> &bu
                     if ((isAvc && IsIDR(accessUnit)) || (isHevc &&
                             ExtendedUtils::IsHevcIDR(accessUnit))) {
                         mVideoBuffer->clear();
+                        lastIDRTimeUs = timeUs;
                     }
                     if (isAvc || isHevc) {
                         mVideoBuffer->queueAccessUnit(accessUnit);
@@ -1388,12 +1413,11 @@ status_t PlaylistFetcher::extractAndQueueAccessUnitsFromTs(const sp<ABuffer> &bu
 
             // Note that we do NOT dequeue any discontinuities except for format change.
             if (stream == LiveSession::STREAMTYPE_VIDEO) {
-                const bool discard = true;
                 status_t status;
                 while (mVideoBuffer->hasBufferAvailable(&status)) {
                     sp<ABuffer> videoBuffer;
                     mVideoBuffer->dequeueAccessUnit(&videoBuffer);
-                    setAccessUnitProperties(videoBuffer, source, discard);
+                    setAccessUnitProperties(videoBuffer, source);
                     packetSource->queueAccessUnit(videoBuffer);
                 }
             }

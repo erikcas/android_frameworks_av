@@ -337,13 +337,18 @@ status_t convertMetaDataToMessage(
                 ptr += 2;
                 size -= 2;
 
-                if (size < length) {
-                    return BAD_VALUE;
+                CHECK(size >= length);
+
+                if ((buffer->size() + 4 + length) > buffer->capacity()) {
+                    sp<ABuffer> tmpBuffer = new ABuffer(buffer->capacity() + 1024);
+                    memcpy(tmpBuffer->data(), buffer->data(), buffer->size());
+                    tmpBuffer->setRange(0, buffer->size());
+                    buffer = tmpBuffer;
                 }
-                status_t err = copyNALUToABuffer(&buffer, ptr, length);
-                if (err != OK) {
-                    return err;
-                }
+
+                memcpy(buffer->data() + buffer->size(), "\x00\x00\x00\x01", 4);
+                memcpy(buffer->data() + buffer->size() + 4, ptr, length);
+                buffer->setRange(0, buffer->size() + 4 + length);
 
                 ptr += length;
                 size -= length;

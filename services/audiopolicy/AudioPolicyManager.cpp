@@ -60,6 +60,8 @@
 #define ALOGVV(a...) do { } while(0)
 #endif
 
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
+
 // A device mask for all audio input devices that are considered "virtual" when evaluating
 // active inputs in getActiveInput()
 //FIXME::  Audio team
@@ -76,6 +78,10 @@
 // type alone is not enough: the address must match too
 #define APM_AUDIO_DEVICE_MATCH_ADDRESS_ALL (AUDIO_DEVICE_IN_REMOTE_SUBMIX | \
                                             AUDIO_DEVICE_OUT_REMOTE_SUBMIX)
+
+// Following delay should be used if the calculated routing delay from all active
+// input streams is higher than this value
+#define MAX_VOICE_CALL_START_DELAY_MS 100
 
 #include <inttypes.h>
 #include <math.h>
@@ -761,6 +767,14 @@ void AudioPolicyManager::updateCallRouting(audio_devices_t rxDevice, int delayMs
         // request to reuse existing output stream if one is already opened to reach the TX
         // path output device
         if (output != AUDIO_IO_HANDLE_NONE) {
+            // close active input (if any) before opening new input
+            audio_io_handle_t activeInput = getActiveInput();
+            if (activeInput != 0) {
+                ALOGV("updateCallRouting() close active input before opening new input");
+                sp<AudioInputDescriptor> activeDesc = mInputs.valueFor(activeInput);
+                stopInput(activeInput, activeDesc->mSessions.itemAt(0));
+                releaseInput(activeInput, activeDesc->mSessions.itemAt(0));
+            }
             sp<AudioOutputDescriptor> outputDesc = mOutputs.valueFor(output);
             ALOG_ASSERT(!outputDesc->isDuplicated(),
                         "updateCallRouting() RX device output is duplicated");
@@ -1039,6 +1053,9 @@ void AudioPolicyManager::setPhoneState(audio_mode_t state)
             setStrategyMute(STRATEGY_SONIFICATION, false, mOutputs.keyAt(i), MUTE_TIME_MS,
                 getDeviceForStrategy(STRATEGY_SONIFICATION, true /*fromCache*/));
         }
+         ALOGV("Setting the delay from %dms to %dms", delayMs,
+               MIN(delayMs, MAX_VOICE_CALL_START_DELAY_MS));
+         delayMs = MIN(delayMs, MAX_VOICE_CALL_START_DELAY_MS);
     }
 
     // Note that despite the fact that getNewOutputDevice() is called on the primary output,
@@ -1902,6 +1919,11 @@ status_t AudioPolicyManager::startOutput(audio_io_handle_t output,
         if (waitMs > muteWaitMs) {
             usleep((waitMs - muteWaitMs) * 2 * 1000);
         }
+    } else {
+        // handle special case for sonification while in call
+        if (isInCall()) {
+            handleIncallSonification(stream, true, false);
+        }
     }
 #ifdef DOLBY_UDC
     // It is observed that in some use-cases where multiple outputs are present eg. bluetooth and headphone,
@@ -1953,7 +1975,7 @@ status_t AudioPolicyManager::stopOutput(audio_io_handle_t output,
     handleEventForBeacon(stream == AUDIO_STREAM_TTS ? STOPPING_BEACON : STOPPING_OUTPUT);
 
     // handle special case for sonification while in call
-    if ((isInCall()) && (outputDesc->mRefCount[stream] == 1)) {
+    if (isInCall()) {
         handleIncallSonification(stream, false, false);
     }
 
@@ -2188,6 +2210,12 @@ status_t AudioPolicyManager::getInputForAttr(const audio_attributes_t *attr,
         device = getDeviceAndMixForInputSource(inputSource, &policyMix);
         if (device == AUDIO_DEVICE_NONE) {
             ALOGW("getInputForAttr() could not find device for source %d", inputSource);
+            return BAD_VALUE;
+        }
+        // block request to open input on USB during voice call
+        if((AUDIO_MODE_IN_CALL == mPhoneState) &&
+            (device == AUDIO_DEVICE_IN_USB_DEVICE)) {
+            ALOGV("getInputForAttr(): blocking the request to open input on USB device");
             return BAD_VALUE;
         }
         if (policyMix != NULL) {
@@ -5198,7 +5226,8 @@ audio_devices_t AudioPolicyManager::getNewOutputDevice(audio_io_handle_t output,
         mForceUse[AUDIO_POLICY_FORCE_FOR_SYSTEM] == AUDIO_POLICY_FORCE_SYSTEM_ENFORCED) {
         device = getDeviceForStrategy(STRATEGY_ENFORCED_AUDIBLE, fromCache);
     } else if (isInCall() ||
-                    outputDesc->isStrategyActive(STRATEGY_PHONE)) {
+                 outputDesc->isStrategyActive(STRATEGY_PHONE) ||
+                 primaryOutputDesc->isStrategyActive(STRATEGY_PHONE)) {
         device = getDeviceForStrategy(STRATEGY_PHONE, fromCache);
     } else if (outputDesc->isStrategyActive(STRATEGY_ENFORCED_AUDIBLE)) {
         device = getDeviceForStrategy(STRATEGY_ENFORCED_AUDIBLE, fromCache);
@@ -6945,8 +6974,7 @@ bool AudioPolicyManager::isInCall()
 }
 
 bool AudioPolicyManager::isStateInCall(int state) {
-    return ((state == AUDIO_MODE_IN_CALL) || (state == AUDIO_MODE_IN_COMMUNICATION) ||
-       ((state == AUDIO_MODE_RINGTONE) && (mPrevPhoneState == AUDIO_MODE_IN_CALL)));
+    return ((state == AUDIO_MODE_IN_CALL) || (state == AUDIO_MODE_IN_COMMUNICATION));
 }
 
 uint32_t AudioPolicyManager::getMaxEffectsCpuLoad()
