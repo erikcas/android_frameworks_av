@@ -11,6 +11,7 @@ LOCAL_SRC_FILES         := SoftAVCDec.cpp
 
 LOCAL_C_INCLUDES := $(TOP)/external/libavc/decoder
 LOCAL_C_INCLUDES += $(TOP)/external/libavc/common
+LOCAL_C_INCLUDES += $(TOP)/external/libmpeg2/common
 LOCAL_C_INCLUDES += $(TOP)/frameworks/av-caf/media/libstagefright/include
 LOCAL_C_INCLUDES += $(TOP)/frameworks/native-caf/include/media/openmax
 
